@@ -112,3 +112,7 @@ hayro-jbig2 = { path = "vendor/hayro-jbig2" }
 lopdf = { path = "vendor/lopdf" }
 winit = { path = "vendor/winit" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
+
+# CI-only test branch: craft-print from the fork carrying the #2192 change. Not for merge.
+[patch."https://github.com/storytold/craft-libs"]
+craft-print = { git = "https://github.com/art804/craft-libs", rev = "912ca59341c4a701c3f9001fd262d304b69dcb3e" }
