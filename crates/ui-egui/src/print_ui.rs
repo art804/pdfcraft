@@ -78,6 +78,9 @@ pub struct PrintDraft {
     pub show_driver_options: bool,
     /// Why the printer's preferences window didn't open (Windows).
     pub driver_error: Option<String>,
+    /// Whether each printer's driver takes two-sided settings, as read in the background for
+    /// the printer picked (see [`TwoSidedSource`]); `None` when it couldn't be read.
+    pub two_sided: std::collections::BTreeMap<String, Option<bool>>,
 }
 
 impl Default for PrintDraft {
@@ -118,6 +121,7 @@ impl Default for PrintDraft {
             driver_choices: Default::default(),
             show_driver_options: false,
             driver_error: None,
+            two_sided: Default::default(),
         }
     }
 }
@@ -178,13 +182,24 @@ impl PrintDraft {
 }
 
 /// Lists the printers off the UI thread (the desktop app sets [`PdfCraftApp::printer_source`]):
-/// on Windows each driver's capabilities are read for its two-sided support, and CUPS' driverless discovery can wait on
-/// the network. Without a source the dialog reads them as it opens, so tests stay deterministic.
+/// CUPS' driverless discovery can wait on the network. Without a source the dialog reads them as
+/// it opens, so tests stay deterministic.
 pub type PrinterSource = std::sync::Arc<dyn Fn() -> Vec<spool::Printer> + Send + Sync>;
 
 /// The system spooler's printers, as the desktop app's [`PrinterSource`].
 pub fn system_printers() -> PrinterSource {
     std::sync::Arc::new(spool::printers)
+}
+
+/// Reads whether one printer's driver takes two-sided settings, off the UI thread, for the
+/// printer picked (the desktop app sets [`PdfCraftApp::two_sided_source`]). Windows' printer list
+/// leaves it unknown: reading a driver Windows can't reach takes it about 48 s, so the list
+/// doesn't wait for every printer's (#2192).
+pub type TwoSidedSource = std::sync::Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>;
+
+/// The system spooler's answer, as the desktop app's [`TwoSidedSource`].
+pub fn system_two_sided() -> TwoSidedSource {
+    std::sync::Arc::new(spool::two_sided)
 }
 
 /// The Print dialog's work in the background: the printer list being read, and the jobs being
@@ -193,6 +208,9 @@ pub fn system_printers() -> PrinterSource {
 pub(crate) struct PrintTasks {
     #[cfg(not(target_arch = "wasm32"))]
     printers: Option<std::sync::mpsc::Receiver<Vec<spool::Printer>>>,
+    /// Two-sided support being read, by printer.
+    #[cfg(not(target_arch = "wasm32"))]
+    two_sided: Vec<(String, std::sync::mpsc::Receiver<Option<bool>>)>,
     #[cfg(not(target_arch = "wasm32"))]
     jobs: Vec<(String, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// The browser print being drawn, a sheet a frame (`web_print`).
@@ -309,6 +327,7 @@ impl PdfCraftApp {
                     d.printers_loading = false;
                 }
             }
+            self.poll_two_sided();
             let mut finished = Vec::new();
             self.print_tasks.jobs.retain(|(printer, rx)| match rx.try_recv() {
                 Ok(r) => {
@@ -325,6 +344,47 @@ impl PdfCraftApp {
                 self.report_print_job(&printer, result);
             }
         }
+    }
+
+    /// Pick up two-sided answers that arrived, and ask for the picked printer's when the list
+    /// doesn't say and nobody has asked yet.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_two_sided(&mut self) {
+        let d = &mut self.print_draft;
+        self.print_tasks.two_sided.retain(|(printer, rx)| match rx.try_recv() {
+            Ok(two_sided) => {
+                d.two_sided.insert(printer.clone(), two_sided);
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                d.two_sided.insert(printer.clone(), None);
+                false
+            }
+        });
+        if self.dialog != Some(crate::Dialog::Print) {
+            return;
+        }
+        let Some(source) = self.two_sided_source.clone() else { return };
+        let Some(printer) = d.printers.iter().find(|p| d.printer.as_ref() == Some(&p.name)) else { return };
+        if printer.two_sided.is_some()
+            || d.two_sided.contains_key(&printer.name)
+            || self.print_tasks.two_sided.iter().any(|(n, _)| *n == printer.name)
+        {
+            return;
+        }
+        let name = printer.name.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.ctx.clone();
+        let asked = name.clone();
+        std::thread::spawn(move || {
+            // The receiver may be gone (the app quit): nothing to report to then.
+            let _ = tx.send(source(&asked));
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        });
+        self.print_tasks.two_sided.push((name, rx));
     }
 
     fn report_print_job(&mut self, printer: &str, result: Result<String, String>) {
@@ -742,7 +802,7 @@ pub(crate) fn body(
             // Windows says which drivers can't print two-sided as they're asked; they keep their
             // own setting, even when Two-sided is Off.
             if let Some(p) = d.printers.iter().find(|p| d.printer.as_ref() == Some(&p.name))
-                && p.two_sided == Some(false)
+                && p.two_sided.or_else(|| d.two_sided.get(&p.name).copied().flatten()) == Some(false)
             {
                 ui.label(egui::RichText::new(tl!("This printer's driver doesn't take two-sided settings from other programs, so its own setting applies. Change it in Properties…")).small().color(t.text_muted));
             }
